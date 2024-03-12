@@ -21,7 +21,8 @@ setup(
     entry_points={
         'console_scripts': [
             'simple_robot_controller = simple_robot_controller.simple_robot_controller:main',
-            'pidtune = pidtune.pidtune:main'
+            'pidtune = pidtune.pidtune:main',
+            'waypointpublisher = waypointpublisher.waypointpublisher:main'
         ],
     },
 )

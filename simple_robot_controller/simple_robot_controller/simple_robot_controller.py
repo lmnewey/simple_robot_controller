@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Quaternion, PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
 
 class PIDController:
     def __init__(self, kp, ki, kd, setpoint=0.0, output_limits=(None, None)):
@@ -39,35 +39,39 @@ class PIDController:
         self.prev_error = error
 
         return -output
-
+    
 class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
         self.timer = self.create_timer(0.1, self.calculate_velocities_callback)
         
+        # Waypoints Queue
+        self.wp_queue = []
+
+        # Controller state
+        self.controller_state = 0  # ready to receive
+
+        # Tolerances
         self.goal_tolerance = 0.1 
         self.goal_angular_tolerance = 0.1
-        # Wheel parameters
-        self.wheel_diameter = 0.175  # meters
-        self.wheel_center_to_center = 0.3  # meters
 
         # Initialize PID controllers
         self.linear_pid = PIDController(kp=0.1, ki=0.0, kd=0.0)
-        self.angular_pid = PIDController(kp=0.1, ki=0.0, kd=0.0)
+        self.angular_pid = PIDController(kp=0.6, ki=0.0, kd=0.0)
+        self.orientation_pid = PIDController(kp=0.1, ki=0.0, kd=0.0)
 
         # Set input limits and output limits for PID controllers
         self.linear_pid.setpoint = 0.0
         self.linear_pid.output_limits = (-0.5, 0.5)
         self.angular_pid.setpoint = 0.0
-        self.angular_pid.output_limits = (-1.0, 1.0)
-
-        #tuning subscribers
-        self.subscription_linear = self.create_subscription(Float32, '/pid_settings/linear', self.linear_callback, 10)
-        self.subscription_angular = self.create_subscription(Float32, '/pid_settings/angular', self.angular_callback, 10)
+        self.angular_pid.output_limits = (-2.0, 2.0)
 
         # Subscribers
-        self.goal_pose_subscription = self.create_subscription(PoseStamped, 'goal_pose', self.goal_pose_callback, 10)
-        #self.pose_subscription = self.create_subscription(PoseStamped, 'odom', self.pose_callback, 10)
+        self.subscription_linear = self.create_subscription(Float32, '/pid_settings/linear', self.linear_callback, 10)
+        self.subscription_angular = self.create_subscription(Float32, '/pid_settings/angular', self.angular_callback, 10)
+        self.waypoints_subscription = self.create_subscription(PoseStamped, '/waypoints', self.wp_callback, 10)
+        self.controllerState_subscription = self.create_subscription(Int32, '/ControllerState', self.cs_callback, 10)
+        self.goal_pose_subscription = self.create_subscription(PoseStamped, '/goal_pose', self.goal_pose_callback, 10)
         self.odom_subscription = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
 
         # Publisher
@@ -85,50 +89,46 @@ class RobotController(Node):
     def angular_callback(self, msg):
         # Update angular PID controller gain
         self.angular_pid.kp = msg.data
+    
+    def wp_callback(self, msg):
+        print("waypoint received")
+        if self.goal_pose is None:
+            self.goal_pose = msg.pose
+        else:
+            self.wp_queue.append(msg.pose)
+
+    def cs_callback(self, msg):
+        self.controller_state = msg.data
 
     def goal_pose_callback(self, msg):
-        self.goal_pose = msg.pose
-        
+        #print("goal received")
+        self.goal_pose = msg.pose        
 
     def odom_callback(self, msg):
         self.current_pose = msg.pose.pose
-        # Extract position and orientation from the odometry message
-        current_x = msg.pose.pose.position.x
-        current_y = msg.pose.pose.position.y
-        current_z = msg.pose.pose.position.z
-        current_orientation = msg.pose.pose.orientation
 
     def calculate_velocities(self):
         if self.goal_pose is None or self.current_pose is None:
-            return 0.0,0.0
+            #print("No pose")
+            return 0.0, 0.0
 
         dt = self.get_clock().now().nanoseconds / 1e9 - self.prev_time
         self.prev_time = self.get_clock().now().nanoseconds / 1e9
 
+        orientation_error = self.calculate_orientation_error(self.goal_pose.orientation, self.current_pose.orientation)
         linear_error = self.calculate_linear_error(self.goal_pose.position, self.current_pose.position)
-        linear_vel = self.linear_pid.update(linear_error, dt)
-        
-
+        linear_vel = self.linear_pid.update(linear_error, dt)       
         angular_error = self.calculate_angular_error(self.goal_pose.orientation, self.current_pose.orientation)
         angular_vel = self.angular_pid.update(angular_error, dt)
 
-        print("velocities")
-        print(linear_vel)
-        print(angular_vel)
-
-        print("error")
-
-        print(linear_error)
-        print(angular_error)
-
-        # cmd_vel = Twist()
-        # cmd_vel.linear.x = linear_vel
-        # cmd_vel.angular.z = angular_vel
-        
-            # Check if the goal has been reached
+        # Check if the goal has been reached
         if linear_error < self.goal_tolerance and abs(angular_error) < self.goal_angular_tolerance:
             print("Goal reached!")
-            self.goal_pose = None  # Clear the goal
+            if self.wp_queue:
+                self.goal_pose = self.wp_queue.pop(0)
+            else:
+                self.goal_pose = None
+
             linear_vel = 0.0
             angular_vel = 0.0
 
@@ -140,44 +140,38 @@ class RobotController(Node):
         linear_error = math.sqrt(x_error ** 2 + y_error ** 2)
         return linear_error
 
-    #def calculate_angular_error(self, goal_orientation, current_orientation):
+    def quaternion_to_euler(self, quaternion):
+        x = quaternion.x
+        y = quaternion.y
+        z = quaternion.z
+        w = quaternion.w
+
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(t0, t1)
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch = math.asin(t2)
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(t3, t4)
+
+        return roll, pitch, yaw
+
+    
     def calculate_angular_error(self, goal_orientation, current_orientation):
-        def quaternion_to_euler(quaternion):
-            x = quaternion.x
-            y = quaternion.y
-            z = quaternion.z
-            w = quaternion.w
-
-            t0 = +2.0 * (w * x + y * z)
-            t1 = +1.0 - 2.0 * (x * x + y * y)
-            roll = math.atan2(t0, t1)
-
-            t2 = +2.0 * (w * y - z * x)
-            t2 = +1.0 if t2 > +1.0 else t2
-            t2 = -1.0 if t2 < -1.0 else t2
-            pitch = math.asin(t2)
-
-            t3 = +2.0 * (w * z + x * y)
-            t4 = +1.0 - 2.0 * (y * y + z * z)
-            yaw = math.atan2(t3, t4)
-
-            return roll, pitch, yaw
-
-            # Calculate the angle between the current orientation and the vector pointing towards the goal position
         goal_position = self.goal_pose.position
         current_position = self.current_pose.position
         goal_angle = math.atan2(goal_position.y - current_position.y, goal_position.x - current_position.x)
         
-        # Convert the goal angle to the range [-pi, pi]
         goal_angle = math.atan2(math.sin(goal_angle), math.cos(goal_angle))
         
-        # Extract the current yaw angle from the quaternion
-        _, _, current_yaw = quaternion_to_euler(current_orientation)
-
-        # Calculate the angular error as the difference between the goal angle and the current yaw angle
+        _, _, current_yaw = self.quaternion_to_euler(current_orientation)
         angular_error = goal_angle - current_yaw
 
-        # Normalize the angular error to the range [-pi, pi]
         if angular_error > math.pi:
             angular_error -= 2 * math.pi
         elif angular_error < -math.pi:
@@ -185,13 +179,31 @@ class RobotController(Node):
 
         return angular_error
  
-    def calculate_velocities_callback(self):
-        
+    def calculate_velocities_callback(self):  
+          
         linear_vel, angular_vel = self.calculate_velocities()
         cmd_vel = Twist()
         cmd_vel.linear.x = linear_vel
         cmd_vel.angular.z = angular_vel
+        #print(linear_vel)
+        #print(angular_vel)
         self.velocity_publisher.publish(cmd_vel)
+
+    def orientation_callback(self, msg):
+        # Update orientation PID controller gain
+        self.orientation_pid.kp = msg.data
+    
+    def calculate_orientation_error(self, goal_orientation, current_orientation):
+        _, _, goal_yaw = self.quaternion_to_euler(goal_orientation)
+        _, _, current_yaw = self.quaternion_to_euler(current_orientation)
+        orientation_error = goal_yaw - current_yaw
+
+        if orientation_error > math.pi:
+            orientation_error -= 2 * math.pi
+        elif orientation_error < -math.pi:
+            orientation_error += 2 * math.pi
+
+        return orientation_error
 
 def main(args=None):
     rclpy.init(args=args)
@@ -203,6 +215,171 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+# class RobotController(Node):
+#     def __init__(self):
+#         super().__init__('robot_controller')
+#         self.timer = self.create_timer(0.1, self.calculate_velocities_callback)
+        
+#         self.goal_tolerance = 0.1 
+#         self.goal_angular_tolerance = 0.1
+#         # Wheel parameters
+#         self.wheel_diameter = 0.175  # meters
+#         self.wheel_center_to_center = 0.3  # meters
+
+#         # Initialize PID controllers
+#         self.linear_pid = PIDController(kp=0.1, ki=0.0, kd=0.0)
+#         self.angular_pid = PIDController(kp=0.1, ki=0.0, kd=0.0)
+
+#         # Set input limits and output limits for PID controllers
+#         self.linear_pid.setpoint = 0.0
+#         self.linear_pid.output_limits = (-0.5, 0.5)
+#         self.angular_pid.setpoint = 0.0
+#         self.angular_pid.output_limits = (-1.0, 1.0)
+
+#         #tuning subscribers
+#         self.subscription_linear = self.create_subscription(Float32, '/pid_settings/linear', self.linear_callback, 10)
+#         self.subscription_angular = self.create_subscription(Float32, '/pid_settings/angular', self.angular_callback, 10)
+
+#         # Subscribers
+#         self.goal_pose_subscription = self.create_subscription(PoseStamped, 'goal_pose', self.goal_pose_callback, 10)
+#         #self.pose_subscription = self.create_subscription(PoseStamped, 'odom', self.pose_callback, 10)
+#         self.odom_subscription = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
+
+#         # Publisher
+#         self.velocity_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+
+#         # Initialize variables
+#         self.goal_pose = None
+#         self.current_pose = None
+#         self.prev_time = self.get_clock().now().nanoseconds / 1e9
+    
+#     def linear_callback(self, msg):
+#         # Update linear PID controller gain
+#         self.linear_pid.kp = msg.data
+
+#     def angular_callback(self, msg):
+#         # Update angular PID controller gain
+#         self.angular_pid.kp = msg.data
+
+#     def goal_pose_callback(self, msg):
+#         self.goal_pose = msg.pose
+        
+
+#     def odom_callback(self, msg):
+#         self.current_pose = msg.pose.pose
+#         # Extract position and orientation from the odometry message
+#         current_x = msg.pose.pose.position.x
+#         current_y = msg.pose.pose.position.y
+#         current_z = msg.pose.pose.position.z
+#         current_orientation = msg.pose.pose.orientation
+
+#     def calculate_velocities(self):
+#         if self.goal_pose is None or self.current_pose is None:
+#             return 0.0,0.0
+
+#         dt = self.get_clock().now().nanoseconds / 1e9 - self.prev_time
+#         self.prev_time = self.get_clock().now().nanoseconds / 1e9
+
+#         linear_error = self.calculate_linear_error(self.goal_pose.position, self.current_pose.position)
+#         linear_vel = self.linear_pid.update(linear_error, dt)
+        
+
+#         angular_error = self.calculate_angular_error(self.goal_pose.orientation, self.current_pose.orientation)
+#         angular_vel = self.angular_pid.update(angular_error, dt)
+
+#         print("velocities")
+#         print(linear_vel)
+#         print(angular_vel)
+
+#         print("error")
+
+#         print(linear_error)
+#         print(angular_error)
+
+#         # cmd_vel = Twist()
+#         # cmd_vel.linear.x = linear_vel
+#         # cmd_vel.angular.z = angular_vel
+        
+#             # Check if the goal has been reached
+#         if linear_error < self.goal_tolerance and abs(angular_error) < self.goal_angular_tolerance:
+#             print("Goal reached!")
+#             self.goal_pose = None  # Clear the goal
+#             linear_vel = 0.0
+#             angular_vel = 0.0
+
+#         return linear_vel, angular_vel
+
+#     def calculate_linear_error(self, goal_position, current_position):
+#         x_error = goal_position.x - current_position.x
+#         y_error = goal_position.y - current_position.y
+#         linear_error = math.sqrt(x_error ** 2 + y_error ** 2)
+#         return linear_error
+
+#     #def calculate_angular_error(self, goal_orientation, current_orientation):
+#     def calculate_angular_error(self, goal_orientation, current_orientation):
+#         def quaternion_to_euler(quaternion):
+#             x = quaternion.x
+#             y = quaternion.y
+#             z = quaternion.z
+#             w = quaternion.w
+
+#             t0 = +2.0 * (w * x + y * z)
+#             t1 = +1.0 - 2.0 * (x * x + y * y)
+#             roll = math.atan2(t0, t1)
+
+#             t2 = +2.0 * (w * y - z * x)
+#             t2 = +1.0 if t2 > +1.0 else t2
+#             t2 = -1.0 if t2 < -1.0 else t2
+#             pitch = math.asin(t2)
+
+#             t3 = +2.0 * (w * z + x * y)
+#             t4 = +1.0 - 2.0 * (y * y + z * z)
+#             yaw = math.atan2(t3, t4)
+
+#             return roll, pitch, yaw
+
+#             # Calculate the angle between the current orientation and the vector pointing towards the goal position
+#         goal_position = self.goal_pose.position
+#         current_position = self.current_pose.position
+#         goal_angle = math.atan2(goal_position.y - current_position.y, goal_position.x - current_position.x)
+        
+#         # Convert the goal angle to the range [-pi, pi]
+#         goal_angle = math.atan2(math.sin(goal_angle), math.cos(goal_angle))
+        
+#         # Extract the current yaw angle from the quaternion
+#         _, _, current_yaw = quaternion_to_euler(current_orientation)
+
+#         # Calculate the angular error as the difference between the goal angle and the current yaw angle
+#         angular_error = goal_angle - current_yaw
+
+#         # Normalize the angular error to the range [-pi, pi]
+#         if angular_error > math.pi:
+#             angular_error -= 2 * math.pi
+#         elif angular_error < -math.pi:
+#             angular_error += 2 * math.pi
+
+#         return angular_error
+ 
+#     def calculate_velocities_callback(self):
+        
+#         linear_vel, angular_vel = self.calculate_velocities()
+#         cmd_vel = Twist()
+#         cmd_vel.linear.x = linear_vel
+#         cmd_vel.angular.z = angular_vel
+#         self.velocity_publisher.publish(cmd_vel)
+
+# def main(args=None):
+#     rclpy.init(args=args)
+#     node = RobotController()
+    
+#     rclpy.spin(node)
+#     node.destroy_node()
+#     rclpy.shutdown()
+
+# if __name__ == '__main__':
+#     main()
 
 
 
