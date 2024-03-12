@@ -5,6 +5,16 @@ from rclpy.node import Node
 from geometry_msgs.msg import Point, Quaternion, PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Int32
+from enum import IntEnum
+
+class ControllerState(IntEnum):
+    READY_TO_RECEIVE = 0
+    MOVING_TO_GOAL = 1
+    IDLE = 2
+    CLEARWAYPOINTS = 3
+    STOP = 4
+    REVERSECOMMANDED = 5
+    REVERSING = 6
 
 class PIDController:
     def __init__(self, kp, ki, kd, setpoint=0.0, output_limits=(None, None)):
@@ -49,7 +59,7 @@ class RobotController(Node):
         self.wp_queue = []
 
         # Controller state
-        self.controller_state = 0  # ready to receive
+        self.controller_state = ControllerState.READY_TO_RECEIVE
 
         # Tolerances
         self.goal_tolerance = 0.1 
@@ -69,8 +79,10 @@ class RobotController(Node):
         # Subscribers
         self.subscription_linear = self.create_subscription(Float32, '/pid_settings/linear', self.linear_callback, 10)
         self.subscription_angular = self.create_subscription(Float32, '/pid_settings/angular', self.angular_callback, 10)
-        self.waypoints_subscription = self.create_subscription(PoseStamped, '/waypoints', self.wp_callback, 10)
-        self.controllerState_subscription = self.create_subscription(Int32, '/ControllerState', self.cs_callback, 10)
+        self.waypoints_subscription = self.create_subscription(PoseStamped, 'waypoints', self.wp_callback, 10)
+        
+        self.controllerState_subscription = self.create_subscription(Int32, 'ControllerState', self.cs_callback, 10)
+        
         self.goal_pose_subscription = self.create_subscription(PoseStamped, '/goal_pose', self.goal_pose_callback, 10)
         self.odom_subscription = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
 
@@ -81,6 +93,23 @@ class RobotController(Node):
         self.goal_pose = None
         self.current_pose = None
         self.prev_time = self.get_clock().now().nanoseconds / 1e9
+    
+    def set_controller_state(self, state):
+        self.controller_state = ControllerState(state)
+        print(state)
+        if self.controller_state == ControllerState.CLEARWAYPOINTS:
+            print("Clearing upcoming way points")
+            self.wp_queue.clear()            
+        if self.controller_state == ControllerState.STOP:
+            print("Stopping current way point and clearing upcoming way points")
+            self.wp_queue.clear()
+            self.goal_pose = None
+        self.publish_controller_state()
+
+    def publish_controller_state(self):
+        msg = Int32()
+        msg.data = self.controller_state
+        #self.controller_state_publisher.publish(msg)
     
     def linear_callback(self, msg):
         # Update linear PID controller gain
@@ -98,11 +127,16 @@ class RobotController(Node):
             self.wp_queue.append(msg.pose)
 
     def cs_callback(self, msg):
-        self.controller_state = msg.data
+        #controller state is the following        
+        print("Controller State Callback called")
+        self.set_controller_state(msg.data)
 
-    def goal_pose_callback(self, msg):
-        #print("goal received")
-        self.goal_pose = msg.pose        
+    def goal_pose_callback(self, msg):               
+        print("waypoint received")
+        if self.goal_pose is None:
+            self.goal_pose = msg.pose
+        else:
+            self.wp_queue.append(msg.pose)
 
     def odom_callback(self, msg):
         self.current_pose = msg.pose.pose
